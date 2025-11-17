@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE settings
+.vscode/
+
+# Dataset folder (downloaded from Roboflow)
+AktiMuW.v4-v4-coco-mmdetection/
+
+# Model outputs
+rtdetr_finetuned/
+
+# Environment files (optional)
+.env
