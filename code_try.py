@@ -161,10 +161,19 @@ if __name__ == "__main__":
 
     print("\nTraining complete!")
 
-    # --------------------- SAVE TORCHSCRIPT ---------------------
-    model.eval()
-    sample = processor(images=Image.open(train_paths[0]).convert("RGB"), return_tensors="pt")
-    scripted = torch.jit.trace(model, sample["pixel_values"].to(DEVICE))
-    ts_path = os.path.join(OUTPUT_DIR, "rtdetr_jetson.pt")
-    scripted.save(ts_path)
-    print(f"Model saved at {ts_path}")
+ # --------------------- SAFE SAVE (Standard PyTorch & HF) ---------------------
+    print("Training complete! Saving model safely...")
+    
+    # 1. Standard PyTorch State Dict Save (.pth)
+    # This is the single file you will download for local JIT conversion.
+    save_path = os.path.join(OUTPUT_DIR, "rtdetr_final.pth")
+    torch.save(model.state_dict(), save_path)
+    print(f" -> Weights saved to {save_path}")
+
+    # 2. Hugging Face Pretrained Save (Folder)
+    # This saves the configuration, making it easy to reload later.
+    model.save_pretrained(OUTPUT_DIR)
+    processor.save_pretrained(OUTPUT_DIR)
+    print(f" -> Hugging Face model and processor saved to {OUTPUT_DIR}")
+
+    print("All saving tasks completed successfully.")
