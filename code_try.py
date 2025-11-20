@@ -32,6 +32,9 @@ rf = Roboflow(api_key="gBDwOMgcuejZmxa38p9L")
 project = rf.workspace("aktimuw").project("aktimuw")
 version = project.version(4)
 dataset = version.download("coco-mmdetection")
+
+DATASET_ROOT = dataset.location         
+print(f"Roboflow dataset extracted to: {DATASET_ROOT}")
                 
 
 # --------------------- LOAD COCO SPLITS ---------------------
