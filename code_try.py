@@ -16,7 +16,7 @@ import json
 
 # --------------------- CONFIG ---------------------
 BATCH_SIZE   = 4
-EPOCHS       = 10
+EPOCHS       = 100
 LR           = 1e-5
 WEIGHT_DECAY = 1e-4
 WARMUP_STEPS = 100
