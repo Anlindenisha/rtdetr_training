@@ -1,32 +1,26 @@
-# --------------------------------------------------------------
-#  RT-DETR TRAINING SCRIPT – GITHUB + ROBOFLOW READY
-# --------------------------------------------------------------
+# ===============================================================
+# COMPLETE RT-DETR TRAINING + EVALUATION (YOLO-COMPARABLE)
+# ===============================================================
 
 import os
 import torch
-import torch.nn as nn
+import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-from sklearn.metrics import confusion_matrix
-import matplotlib.pyplot as plt
-from transformers import RTDetrForObjectDetection, RTDetrImageProcessor, get_scheduler
 from tqdm.auto import tqdm
-import roboflow
-import json
 
-# --------------------- CONFIG ---------------------
-BATCH_SIZE   = 4
-EPOCHS       = 100
-LR           = 1e-5
-WEIGHT_DECAY = 1e-4
-WARMUP_STEPS = 100
-GRAD_CLIP    = 1.0
-DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-OUTPUT_DIR   = "./rtdetr_finetuned"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+from transformers import (
+    RTDetrForObjectDetection,
+    RTDetrImageProcessor,
+    get_scheduler
+)
 
-# --------------------- DOWNLOAD DATASET --------------------- 
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
 
+# ===============================================================
+# CONFIGURATION
+# ===============================================================
 from roboflow import Roboflow
 rf = Roboflow(api_key="gBDwOMgcuejZmxa38p9L")
 project = rf.workspace("aktimuw").project("aktimuw")
@@ -35,145 +29,233 @@ dataset = version.download("coco-mmdetection")
 
 DATASET_ROOT = dataset.location         
 print(f"Roboflow dataset extracted to: {DATASET_ROOT}")
-                
 
-# --------------------- LOAD COCO SPLITS ---------------------
-def load_coco_split(split: str):
+IMG_SIZE = 640
+BATCH_SIZE = 4
+EPOCHS = 50
+LR = 1e-5
+WEIGHT_DECAY = 1e-4
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ===============================================================
+# LOAD COCO DATASETS
+# ===============================================================
+def load_coco(split):
     ann_path = os.path.join(DATASET_ROOT, split, "_annotations.coco.json")
-    data = json.load(open(ann_path))
-    img_map = {img["id"]: img for img in data["images"]}
-    ann_map = {}
-    for ann in data["annotations"]:
-        ann_map.setdefault(ann["image_id"], []).append(ann)
+    coco = COCO(ann_path)
 
-    img_paths, img_ids, orig_ids = [], [], []
-    for iid, info in img_map.items():
-        path = os.path.join(DATASET_ROOT, split, info["file_name"])
-        img_paths.append(path)
-        img_ids.append(iid)
-        orig_ids.append(info["id"])
+    images = []
+    for img in coco.dataset["images"]:
+        img_path = os.path.join(DATASET_ROOT, split, img["file_name"])
+        images.append((img["id"], img_path))
 
-    return img_paths, img_ids, ann_map, data["categories"], orig_ids
+    return coco, images
 
-train_paths, train_ids, train_ann, cats, train_orig = load_coco_split("train")
-val_paths, val_ids, val_ann, _, val_orig = load_coco_split("valid")
-test_paths, test_ids, test_ann, _, test_orig = load_coco_split("test")
 
-cat_id_to_idx = {cat["id"]: idx for idx, cat in enumerate(cats)}
-idx_to_name = {idx: cat["name"] for idx, cat in enumerate(cats)}
-NUM_LABELS = len(cats)
+coco_train, train_imgs = load_coco("train")
+coco_val, val_imgs = load_coco("valid")
+coco_test, test_imgs = load_coco("test")
 
-print(f"Classes: {NUM_LABELS} -> {[c['name'] for c in cats]}")
+cat_ids = coco_train.getCatIds()
+cat_id_to_idx = {cid: i for i, cid in enumerate(cat_ids)}
+idx_to_name = {i: coco_train.loadCats(cid)[0]["name"] for cid, i in cat_id_to_idx.items()}
+NUM_CLASSES = len(cat_ids)
 
-# --------------------- MODEL & PROCESSOR ---------------------
+print(f"Number of classes: {NUM_CLASSES}")
+
+# ===============================================================
+# DATASET CLASS
+# ===============================================================
+class COCODataset(Dataset):
+    def __init__(self, images, coco, processor):
+        self.images = images
+        self.coco = coco
+        self.processor = processor
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_id, path = self.images[idx]
+        image = Image.open(path).convert("RGB")
+
+        ann_ids = self.coco.getAnnIds(imgIds=img_id)
+        anns = self.coco.loadAnns(ann_ids)
+
+        boxes = []
+        labels = []
+
+        for ann in anns:
+            boxes.append(ann["bbox"])
+            labels.append(cat_id_to_idx[ann["category_id"]])
+
+        boxes = torch.tensor(boxes, dtype=torch.float32)
+        labels = torch.tensor(labels, dtype=torch.long)
+
+        encoding = self.processor(images=image, return_tensors="pt")
+
+        return {
+            "pixel_values": encoding["pixel_values"].squeeze(0),
+            "labels": {
+                "boxes": boxes,
+                "class_labels": labels
+            },
+            "image_id": img_id
+        }
+
+# ===============================================================
+# COLLATE FUNCTION (CRITICAL)
+# ===============================================================
+def collate_fn(batch):
+    pixel_values = torch.stack([b["pixel_values"] for b in batch]).to(DEVICE)
+
+    labels = []
+    for b in batch:
+        labels.append({
+            "boxes": b["labels"]["boxes"].to(DEVICE),
+            "class_labels": b["labels"]["class_labels"].to(DEVICE)
+        })
+
+    return {
+        "pixel_values": pixel_values,
+        "labels": labels,
+        "image_id": [b["image_id"] for b in batch]
+    }
+
+# ===============================================================
+# MODEL & PROCESSOR
+# ===============================================================
 processor = RTDetrImageProcessor.from_pretrained(
     "PekingU/rtdetr_r50vd_coco_o365",
     do_resize=True,
-    size={"height": 640, "width": 640},
-    do_pad=True,
-    size_divisor=32,
+    size={"height": IMG_SIZE, "width": IMG_SIZE},
+    do_pad=True
 )
 
 model = RTDetrForObjectDetection.from_pretrained(
     "PekingU/rtdetr_r50vd_coco_o365",
-    num_labels=NUM_LABELS,
-    ignore_mismatched_sizes=True,
+    num_labels=NUM_CLASSES,
+    ignore_mismatched_sizes=True
 ).to(DEVICE)
 
-# --------------------- DATASET CLASS ---------------------
-class COCODataset(Dataset):
-    def __init__(self, img_paths, img_ids, ann_map, processor, cat_map, orig_ids):
-        self.img_paths = img_paths
-        self.img_ids = img_ids
-        self.ann_map = ann_map
-        self.processor = processor
-        self.cat_map = cat_map
-        self.orig_ids = orig_ids
+# ===============================================================
+# DATALOADERS (WINDOWS SAFE)
+# ===============================================================
+train_ds = COCODataset(train_imgs, coco_train, processor)
+val_ds = COCODataset(val_imgs, coco_val, processor)
+test_ds = COCODataset(test_imgs, coco_test, processor)
 
-    def __len__(self):
-        return len(self.img_paths)
+train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                      collate_fn=collate_fn, num_workers=0)
 
-    def __getitem__(self, idx):
-        path = self.img_paths[idx]
-        iid = self.img_ids[idx]
-        img = Image.open(path).convert("RGB")
-        raw_anns = self.ann_map.get(iid, [])
+val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                    collate_fn=collate_fn, num_workers=0)
 
-        if raw_anns:
-            class_labels = torch.tensor([self.cat_map[a["category_id"]] for a in raw_anns], dtype=torch.long)
-            boxes = torch.tensor([a["bbox"] for a in raw_anns], dtype=torch.float)
-        else:
-            class_labels = torch.empty((0,), dtype=torch.long)
-            boxes = torch.empty((0, 4), dtype=torch.float)
+test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
+                     collate_fn=collate_fn, num_workers=0)
 
-        labels = {"class_labels": class_labels, "boxes": boxes}
-        enc = self.processor(images=img, return_tensors="pt")
-        pixel_values = enc["pixel_values"].squeeze(0)
+# ===============================================================
+# COCO EVALUATION FUNCTION (YOLO-COMPARABLE)
+# ===============================================================
+def evaluate(model, dataloader, coco_gt):
+    model.eval()
+    coco_results = []
 
-        return {"pixel_values": pixel_values, "labels": labels, "image_id": self.orig_ids[idx]}
+    with torch.no_grad():
+        for batch in dataloader:
+            outputs = model(batch["pixel_values"])
 
-def collate_fn(batch):
-    pixel_values = torch.stack([b["pixel_values"] for b in batch]).to(DEVICE)
-    labels = [{"class_labels": b["labels"]["class_labels"].to(DEVICE),
-               "boxes": b["labels"]["boxes"].to(DEVICE)} for b in batch]
-    return {"pixel_values": pixel_values, "labels": labels, "image_id": [b["image_id"] for b in batch]}
+            results = processor.post_process_object_detection(
+                outputs,
+                threshold=0.001,
+                target_sizes=[(IMG_SIZE, IMG_SIZE)] * len(batch["image_id"])
+            )
 
-train_ds = COCODataset(train_paths, train_ids, train_ann, processor, cat_id_to_idx, train_orig)
-val_ds = COCODataset(val_paths, val_ids, val_ann, processor, cat_id_to_idx, val_orig)
-test_ds = COCODataset(test_paths, test_ids, test_ann, processor, cat_id_to_idx, test_orig)
+            for img_id, r in zip(batch["image_id"], results):
+                for box, score, label in zip(r["boxes"], r["scores"], r["labels"]):
+                    coco_results.append({
+                        "image_id": img_id,
+                        "category_id": int(label),
+                        "bbox": [
+                            float(box[0]),
+                            float(box[1]),
+                            float(box[2] - box[0]),
+                            float(box[3] - box[1])
+                        ],
+                        "score": float(score)
+                    })
 
-# --------------------- MAIN TRAINING ---------------------
-if __name__ == "__main__":
-    import multiprocessing
-    multiprocessing.freeze_support()
+    coco_dt = coco_gt.loadRes(coco_results)
+    coco_eval = COCOeval(coco_gt, coco_dt, "bbox")
+    coco_eval.evaluate()
+    coco_eval.accumulate()
 
-    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                          num_workers=0, collate_fn=collate_fn)
-    val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
-                        num_workers=0, collate_fn=collate_fn)
-    test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
-                         num_workers=0, collate_fn=collate_fn)
+    return coco_eval.stats
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    num_steps = len(train_dl) * EPOCHS
-    lr_scheduler = get_scheduler("linear", optimizer, WARMUP_STEPS, num_steps)
-    scaler = torch.amp.GradScaler()
+# ===============================================================
+# TRAINING + EPOCH-WISE VALIDATION
+# ===============================================================
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        for batch in tqdm(train_dl, desc=f"Epoch {epoch}"):
-            px = batch["pixel_values"]
-            labels = batch["labels"]
+scheduler = get_scheduler(
+    "linear",
+    optimizer,
+    num_warmup_steps=100,
+    num_training_steps=EPOCHS * len(train_dl)
+)
 
-            optimizer.zero_grad()
-            with torch.amp.autocast(device_type="cuda"):
-                out = model(px, labels=labels)
-                loss = out.loss
+results_log = []
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            scaler.step(optimizer)
-            scaler.update()
-            lr_scheduler.step()
+for epoch in range(1, EPOCHS + 1):
+    model.train()
+    epoch_loss = 0.0
 
-        print(f"\nEpoch {epoch} complete (loss={loss.item():.4f})")
+    for batch in tqdm(train_dl, desc=f"Epoch {epoch}/{EPOCHS}"):
+        optimizer.zero_grad()
+        outputs = model(batch["pixel_values"], labels=batch["labels"])
+        loss = outputs.loss
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
 
-    print("\nTraining complete!")
+        epoch_loss += loss.item()
 
- # --------------------- SAFE SAVE (Standard PyTorch & HF) ---------------------
-    print("Training complete! Saving model safely...")
-    
-    # 1. Standard PyTorch State Dict Save (.pth)
-    # This is the single file you will download for local JIT conversion.
-    save_path = os.path.join(OUTPUT_DIR, "rtdetr_final.pth")
-    torch.save(model.state_dict(), save_path)
-    print(f" -> Weights saved to {save_path}")
+    avg_loss = epoch_loss / len(train_dl)
 
-    # 2. Hugging Face Pretrained Save (Folder)
-    # This saves the configuration, making it easy to reload later.
-    model.save_pretrained(OUTPUT_DIR)
-    processor.save_pretrained(OUTPUT_DIR)
-    print(f" -> Hugging Face model and processor saved to {OUTPUT_DIR}")
+    stats = evaluate(model, val_dl, coco_val)
 
-    print("All saving tasks completed successfully.")
+    results_log.append({
+        "epoch": epoch,
+        "loss": avg_loss,
+        "mAP@0.5": stats[1],
+        "mAP@0.5:0.95": stats[0],
+        "Recall": stats[8]
+    })
+
+    print(
+        f"Epoch {epoch} | "
+        f"Loss: {avg_loss:.4f} | "
+        f"mAP@0.5: {stats[1]:.4f} | "
+        f"mAP@0.5:0.95: {stats[0]:.4f}"
+    )
+
+# ===============================================================
+# SAVE YOLO-STYLE RESULTS.CSV
+# ===============================================================
+df = pd.DataFrame(results_log)
+df.to_csv(os.path.join(OUTPUT_DIR, "rtdetr_results.csv"), index=False)
+
+print("\nSaved rtdetr_results.csv")
+
+# ===============================================================
+# FINAL TEST SET EVALUATION
+# ===============================================================
+final_stats = evaluate(model, test_dl, coco_test)
+
+print("\nFINAL TEST METRICS")
+print(f"mAP@0.5:0.95 = {final_stats[0]:.4f}")
+print(f"mAP@0.5      = {final_stats[1]:.4f}")
+print(f"Recall       = {final_stats[8]:.4f}")
+
+print("\nRT-DETR TRAINING + EVALUATION COMPLETED SUCCESSFULLY 🎉")
